@@ -293,6 +293,9 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:
     """Get or create a buffer for all-to-all communication."""
     global _buffer
+    # DeepEP internode path requires NVSHMEM when EP world size exceeds
+    # the max NVLink peers per node.
+    num_max_nvl_peers = 8
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (
         Buffer.get_dispatch_config(group.size()),
@@ -301,9 +304,22 @@ def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:
         num_nvl_bytes = max(
             config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes
         )
-        num_rdma_bytes = max(
-            config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
-        )
+        try:
+            num_rdma_bytes = max(
+                config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                num_rdma_bytes,
+            )
+        except RuntimeError as e:
+            # NVSHMEM-disabled builds can still run intranode (no RDMA).
+            if "NVSHMEM is disable during compilation" not in str(e):
+                raise
+            if group.size() > num_max_nvl_peers:
+                raise RuntimeError(
+                    "DeepEP was built without NVSHMEM, but this run requires "
+                    "RDMA communication. Rebuild/install DeepEP with NVSHMEM "
+                    f"enabled or reduce EP group size to <= {num_max_nvl_peers}."
+                ) from e
+            num_rdma_bytes = max(0, num_rdma_bytes)
 
     if (
         _buffer is None

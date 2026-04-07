@@ -19,6 +19,38 @@ from torchtitan.ops.scatter_add import deterministic_scatter_add
 from torchtitan.protocols.module import Module
 
 
+def _run_experts_ep_sm80(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Expert computation for EP-dispatched, pre-sorted tokens on SM80 (A100) hardware.
+
+    Called when EP is active (weights are EP-sharded DTensor local shards) but
+    torch._grouped_mm is not available (SM90+ only). Unlike _run_experts_for_loop,
+    this function makes no assumptions about padding and uses torch.mm directly.
+
+    Args:
+        w1, w2, w3: Local weight shards with shape (num_local_experts, ffn_dim, dim).
+        x: Dispatched, permuted tokens sorted by local expert, shape (total_tokens, dim).
+        num_tokens_per_expert: Token count per local expert, length = num_local_experts.
+    """
+    counts = num_tokens_per_expert.tolist()
+    x_splits = torch.split(x, counts, dim=0)
+    out_splits = []
+    for i, x_expert in enumerate(x_splits):
+        if x_expert.shape[0] == 0:
+            continue
+        h = F.silu(torch.mm(x_expert, w1[i].t()))
+        h = h * torch.mm(x_expert, w3[i].t())
+        out_splits.append(torch.mm(h, w2[i].t()))
+    if not out_splits:
+        return x.new_empty(0, w2.shape[-1])
+    return torch.cat(out_splits, dim=0)
+
+
 # NOTE: keeping this for-loop implementation for comparison
 #       and readability, may remove later
 def _run_experts_for_loop(
@@ -112,6 +144,15 @@ class GroupedExperts(Module):
 
         if self.use_grouped_mm:
             return _run_experts_grouped_mm(w1, w2, w3, x, num_tokens_per_expert)
+        elif (
+            isinstance(self.w1, DTensor)
+            # pyrefly: ignore[not-iterable]
+            and "ep" in self.w1.device_mesh.mesh_dim_names
+        ):
+            # SM80 (A100) fallback for EP+DeepEP: torch._grouped_mm is SM90-only.
+            # _run_experts_for_loop was designed for the non-EP reorderer-sorted path
+            # and is not compatible with DeepEP's pre-dispatched, tightly-packed layout.
+            return _run_experts_ep_sm80(w1, w2, w3, x, num_tokens_per_expert)
         else:
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
 
