@@ -40,11 +40,24 @@ def _run_experts_ep_sm80(
     num_local_experts = w1.shape[0]
     counts = num_tokens_per_expert.tolist()
     
-    # Activation checkpointing during backward may save/restore global expert counts,
-    # which don't match the local expert count after dispatch. In that case, fall back
-    # to the for-loop implementation which handles mismatched layouts more gracefully.
+    # Checkpoint backward detection: saved token counts don't match local expert count.
+    # This occurs because activation checkpoint recomputation receives locally-dispatched
+    # tokens but tries to apply globally-saved expert counts.
     if len(counts) != num_local_experts:
-        return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
+        raise RuntimeError(
+            "Activation checkpointing with EP+DeepEP is not supported on A100 (SM80) "
+            "because checkpoint recomputation cannot reliably map globally-saved expert "
+            "counts to locally-dispatched tokens. "
+            f"Expected {num_local_experts} local experts but got {len(counts)} saved counts. "
+            "\n"
+            "To fix, either:\n"
+            "  1. Disable activation checkpointing (--activation_checkpoint=false)\n"
+            "  2. Disable activation checkpointing for MoE layers specifically\n"
+            "  3. Use H100/newer GPUs that support torch._grouped_mm (SM90+)\n"
+            "\n"
+            "Alternatively, file an issue on PyTorch if you need activation checkpointing "
+            "with EP+DeepEP on A100."
+        )
     
     # Validate token counts match available buffer
     total_available = sum(counts)
@@ -169,6 +182,12 @@ class GroupedExperts(Module):
             # SM80 (A100) fallback for EP+DeepEP: torch._grouped_mm is SM90-only.
             # _run_experts_for_loop was designed for the non-EP reorderer-sorted path
             # and is not compatible with DeepEP's pre-dispatched, tightly-packed layout.
+            # 
+            # Note: Activation checkpointing with EP+DeepEP is not supported on A100
+            # because checkpoint saves global expert counts but recomputation receives
+            # locally-dispatched tokens, causing a mismatch that cannot be resolved
+            # at the expert computation level. If you need activation checkpointing,
+            # disable it for MoE layers or use H100/newer GPUs with torch._grouped_mm.
             return _run_experts_ep_sm80(w1, w2, w3, x, num_tokens_per_expert)
         else:
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
