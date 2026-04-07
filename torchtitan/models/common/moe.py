@@ -38,7 +38,14 @@ def _run_experts_ep_sm80(
         num_tokens_per_expert: Token count per local expert, length = num_local_experts.
     """
     counts = num_tokens_per_expert.tolist()
-    x_splits = torch.split(x, counts, dim=0)
+    total_tokens = sum(counts)
+    if total_tokens > x.shape[0]:
+        raise RuntimeError(
+            "Invalid EP token layout: sum(num_tokens_per_expert) exceeds "
+            f"input token buffer length ({total_tokens} > {x.shape[0]})."
+        )
+    # DeepEP may return a larger token buffer than the valid routed-token prefix.
+    x_splits = torch.split(x[:total_tokens], counts, dim=0)
     out_splits = []
     for i, x_expert in enumerate(x_splits):
         if x_expert.shape[0] == 0:
