@@ -40,31 +40,26 @@ def _run_experts_ep_sm80(
     num_local_experts = w1.shape[0]
     counts = num_tokens_per_expert.tolist()
     
-    # Handle checkpoint backward case: saved inputs use global expert counts,
-    # but after dispatch we have local counts. If mismatch, infer from token tensor.
+    # Activation checkpointing during backward may save/restore global expert counts,
+    # which don't match the local expert count after dispatch. In that case, fall back
+    # to the for-loop implementation which handles mismatched layouts more gracefully.
     if len(counts) != num_local_experts:
-        # In checkpoint backward, tokens are already dispatched and sorted by local expert.
-        # Distribute remaining tokens evenly across local experts.
-        total_available = x.shape[0]
-        base_tokens = total_available // num_local_experts
-        remainder = total_available % num_local_experts
-        counts = [base_tokens + (1 if i < remainder else 0) for i in range(num_local_experts)]
-    else:
-        total_available = sum(counts)
-        if total_available > x.shape[0]:
-            raise RuntimeError(
-                "Invalid EP token layout: sum(num_tokens_per_expert) exceeds "
-                f"input token buffer length ({total_available} > {x.shape[0]})."
-            )
+        return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
+    
+    # Validate token counts match available buffer
+    total_available = sum(counts)
+    if total_available > x.shape[0]:
+        raise RuntimeError(
+            "Invalid EP token layout: sum(num_tokens_per_expert) exceeds "
+            f"input token buffer length ({total_available} > {x.shape[0]})."
+        )
     
     # DeepEP may return a larger token buffer than the valid routed-token prefix.
-    x_splits = torch.split(x[:sum(counts)], counts, dim=0)
-    
+    x_splits = torch.split(x[:total_available], counts, dim=0)
     out_splits = []
     for i, x_expert in enumerate(x_splits):
         if x_expert.shape[0] == 0:
             continue
-        # Use .transpose() like _run_experts_for_loop to handle backward/checkpoint safety
         h = F.silu(torch.matmul(x_expert, w1[i].transpose(-2, -1)))
         h = h * torch.matmul(x_expert, w3[i].transpose(-2, -1))
         out_splits.append(torch.matmul(h, w2[i].transpose(-2, -1)))
