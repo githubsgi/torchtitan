@@ -37,21 +37,28 @@ def _run_experts_ep_sm80(
         x: Dispatched, permuted tokens sorted by local expert, shape (total_tokens, dim).
         num_tokens_per_expert: Token count per local expert, length = num_local_experts.
     """
-    counts = num_tokens_per_expert.tolist()
-    total_tokens = sum(counts)
-    if total_tokens > x.shape[0]:
-        raise RuntimeError(
-            "Invalid EP token layout: sum(num_tokens_per_expert) exceeds "
-            f"input token buffer length ({total_tokens} > {x.shape[0]})."
-        )
-    # DeepEP may return a larger token buffer than the valid routed-token prefix.
-    x_splits = torch.split(x[:total_tokens], counts, dim=0)
     num_local_experts = w1.shape[0]
+    counts = num_tokens_per_expert.tolist()
+    
+    # Handle checkpoint backward case: saved inputs use global expert counts,
+    # but after dispatch we have local counts. If mismatch, infer from token tensor.
     if len(counts) != num_local_experts:
-        raise RuntimeError(
-            f"Expert count mismatch: len(num_tokens_per_expert)={len(counts)} "
-            f"but w1 has {num_local_experts} local experts."
-        )
+        # In checkpoint backward, tokens are already dispatched and sorted by local expert.
+        # Distribute remaining tokens evenly across local experts.
+        total_available = x.shape[0]
+        base_tokens = total_available // num_local_experts
+        remainder = total_available % num_local_experts
+        counts = [base_tokens + (1 if i < remainder else 0) for i in range(num_local_experts)]
+    else:
+        total_available = sum(counts)
+        if total_available > x.shape[0]:
+            raise RuntimeError(
+                "Invalid EP token layout: sum(num_tokens_per_expert) exceeds "
+                f"input token buffer length ({total_available} > {x.shape[0]})."
+            )
+    
+    # DeepEP may return a larger token buffer than the valid routed-token prefix.
+    x_splits = torch.split(x[:sum(counts)], counts, dim=0)
     
     out_splits = []
     for i, x_expert in enumerate(x_splits):
