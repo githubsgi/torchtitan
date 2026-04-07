@@ -46,13 +46,21 @@ def _run_experts_ep_sm80(
         )
     # DeepEP may return a larger token buffer than the valid routed-token prefix.
     x_splits = torch.split(x[:total_tokens], counts, dim=0)
+    num_local_experts = w1.shape[0]
+    if len(counts) != num_local_experts:
+        raise RuntimeError(
+            f"Expert count mismatch: len(num_tokens_per_expert)={len(counts)} "
+            f"but w1 has {num_local_experts} local experts."
+        )
+    
     out_splits = []
     for i, x_expert in enumerate(x_splits):
         if x_expert.shape[0] == 0:
             continue
-        h = F.silu(torch.mm(x_expert, w1[i].t()))
-        h = h * torch.mm(x_expert, w3[i].t())
-        out_splits.append(torch.mm(h, w2[i].t()))
+        # Use .transpose() like _run_experts_for_loop to handle backward/checkpoint safety
+        h = F.silu(torch.matmul(x_expert, w1[i].transpose(-2, -1)))
+        h = h * torch.matmul(x_expert, w3[i].transpose(-2, -1))
+        out_splits.append(torch.matmul(h, w2[i].transpose(-2, -1)))
     if not out_splits:
         return x.new_empty(0, w2.shape[-1])
     return torch.cat(out_splits, dim=0)
