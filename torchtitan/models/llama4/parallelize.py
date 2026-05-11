@@ -43,6 +43,27 @@ from torchtitan.models.llama4.model import Llama4Model
 from torchtitan.tools.logging import logger
 
 
+_logged_moe_comm_backends: set[str] = set()
+
+
+def _log_moe_comm_backend_once(backend_name: str, implementation: str) -> None:
+    if backend_name in _logged_moe_comm_backends:
+        return
+
+    is_rank0 = not torch.distributed.is_initialized()
+    if torch.distributed.is_initialized():
+        is_rank0 = torch.distributed.get_rank() == 0
+
+    if is_rank0:
+        logger.info(
+            "MoE token dispatcher backend selected: %s (%s)",
+            backend_name,
+            implementation,
+        )
+
+    _logged_moe_comm_backends.add(backend_name)
+
+
 def parallelize_llama(
     model: Llama4Model,
     *,
@@ -445,9 +466,11 @@ def apply_moe_ep_tp(
         if ep_mesh is None:
             experts_mesh = tp_mesh
             experts_plan = TensorParallel()
+            _log_moe_comm_backend_once("standard", type(experts_plan).__name__)
         else:
             experts_mesh = ep_mesh
             experts_plan = ExpertParallel()
+            _log_moe_comm_backend_once("standard", type(experts_plan).__name__)
             # pyrefly: ignore [missing-attribute]
             dispatcher = transformer_block.moe.experts.token_dispatcher
             if tp_mesh is not None:
