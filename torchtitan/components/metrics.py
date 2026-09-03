@@ -296,6 +296,30 @@ class TensorLoggingConfig(Configurable.Config):
     The regex runs after collection and derivation. It changes only what is published.
     """
 
+    vector_metrics: bool = False
+    """Whether to record width-preserving vector metrics such as MoE expert load.
+
+    Vector metrics are reduced element-wise, so a per-expert imbalance ratio
+    stays correct under EP and CP. Collapsing the same counts into the scalar
+    path would lose the per-element identity the ratio depends on.
+    """
+
+    publish_vector_elements: bool = False
+    """Whether to publish one scalar per vector element in addition to summaries.
+
+    Off by default: a 64-expert model with 32 MoE layers would emit 2048 extra
+    series per logging step. Derived `total`, `max`, `min`, `mean` and
+    `imbalance` values are published either way.
+    """
+
+    moe_shape_manifest: str = ""
+    """Path to write the static MoE grouped-GEMM shape manifest, or empty to skip.
+
+    Written once at setup. Grouped-GEMM `K` and `N` come from the model config,
+    so recording them needs no per-step instrumentation; the per-expert token
+    counts supply the matching `M`.
+    """
+
     def __post_init__(self) -> None:
         if self.freq <= 0:
             raise ValueError("metrics.tensor_logging.freq must be positive")

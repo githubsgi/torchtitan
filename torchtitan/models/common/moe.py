@@ -18,6 +18,7 @@ from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_s
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
+from torchtitan.observability import tensor_logging
 from torchtitan.protocols.module import Module
 
 from .token_dispatcher import LocalTokenDispatcher
@@ -400,6 +401,15 @@ class MoE(Module):
             persistent=False,
         )
 
+        # Expert load is only meaningful per expert: summing the counts into a
+        # generic population loses the identity needed for an imbalance ratio,
+        # so this uses the width-preserving vector slab rather than log_stats.
+        tensor_logging.register_vector(
+            self,
+            ["tokens_per_expert"],
+            width=num_experts,
+        )
+
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -444,6 +454,15 @@ class MoE(Module):
         if self.training:
             with torch.no_grad():
                 self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
+
+        # Counts are full-width over E on every rank but cover only this rank's
+        # token shard, so the cross-rank SUM in vector_metrics yields the exact
+        # global per-expert totals under DP, CP, TP and EP alike.
+        if tensor_logging.should_run_logging_calls():
+            tensor_logging.log_vector(
+                self,
+                tokens_per_expert=num_local_tokens_per_expert_E,
+            )
 
         out_BLD = self.routed_experts(
             x_BLD,

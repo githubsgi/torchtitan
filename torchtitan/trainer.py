@@ -57,7 +57,7 @@ from torchtitan.models.common.token_dispatcher import (
     LocalTokenDispatcher,
     MinimalAsyncEPTokenDispatcher,
 )
-from torchtitan.observability import structured_logger as sl, tensor_logging
+from torchtitan.observability import moe_shapes, structured_logger as sl, tensor_logging
 from torchtitan.observability.tensor_logging.runtime import (
     _wrap_fwd_bwd_for_tensor_logging_capture,
 )
@@ -277,6 +277,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     validator: BaseValidator
     metrics_processor: MetricsProcessor
     tensor_logging: tensor_logging.TensorLoggingState | None
+    vector_logging: tensor_logging.VectorLoggingState | None
     checkpointer: BaseCheckpointManager
 
     # runtime utilities
@@ -579,6 +580,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
 
         self.tensor_logging = None
+        self.vector_logging = None
         tensor_logging_config = config.metrics.tensor_logging
         if tensor_logging_config.enabled:
             effective_freq = math.lcm(
@@ -600,6 +602,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 publish_filter_regex=tensor_logging_config.publish_filter_regex,
                 pp_enabled=parallel_dims.pp_enabled,
             )
+
+            if tensor_logging_config.vector_metrics:
+                # Shares the scalar path's cadence gate, so this must follow
+                # init() and stay inside the same enabled scope.
+                self.vector_logging = tensor_logging.init_vectors(
+                    self.model_parts,
+                    device=self.device,
+                    publish_elements=tensor_logging_config.publish_vector_elements,
+                    pp_enabled=parallel_dims.pp_enabled,
+                )
+
+            if (
+                tensor_logging_config.moe_shape_manifest
+                and torch.distributed.get_rank() == 0
+            ):
+                # Static shapes are identical on every rank; one writer avoids
+                # a write race on a shared filesystem.
+                moe_shapes.write_moe_shape_manifest(
+                    moe_shapes.collect_moe_shapes(self.model_parts),
+                    tensor_logging_config.moe_shape_manifest,
+                )
 
         self.lr_schedulers = config.lr_scheduler.build(
             optimizers=self.optimizers,
@@ -1016,6 +1039,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         if self.tensor_logging is not None and tensor_logging.is_enabled():
             with sl.log_trace_span("tensor_logging_collect"):
                 tensor_metrics = self.tensor_logging.collect()
+                if self.vector_logging is not None:
+                    tensor_metrics.update(self.vector_logging.collect())
 
         with sl.log_trace_span("collect_dist_metrics"):
 

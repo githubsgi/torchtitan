@@ -56,8 +56,16 @@ class StatisticBufferSlot(NamedTuple):
     slot_index: torch.Tensor  # CPU scalar row used by the backward hook
 
 
-def _get_registered_metric_names(metric_source: MetricSource) -> list[str] | None:
+def _get_registered_metric_names(
+    metric_source: MetricSource,
+    *,
+    names_attr: str = _REGISTERED_METRIC_NAMES_ATTR,
+) -> list[str] | None:
     """Return names registered directly on this module or parameter.
+
+    `names_attr` selects which registry to read. Scalar statistics use the
+    default; `vector_metrics` passes its own attribute so the two registries
+    stay disjoint and each allocates only its own buffer rows.
 
     Example:
 
@@ -68,7 +76,7 @@ def _get_registered_metric_names(metric_source: MetricSource) -> list[str] | Non
 
     return cast(
         list[str] | None,
-        metric_source.__dict__.get(_REGISTERED_METRIC_NAMES_ATTR),
+        metric_source.__dict__.get(names_attr),
     )
 
 
@@ -120,10 +128,24 @@ def register(
 
     if _active_state is not None:
         raise RuntimeError("register tensor names before tensor_logging.init()")
-    existing_names = _get_registered_metric_names(metric_source)
+    _register_names(metric_source, registered_names)
+
+
+def _register_names(
+    metric_source: MetricSource,
+    registered_names: Sequence[str],
+    *,
+    names_attr: str = _REGISTERED_METRIC_NAMES_ATTR,
+) -> None:
+    """Append names to one registry on this source, creating it if absent."""
+
+    existing_names = _get_registered_metric_names(
+        metric_source,
+        names_attr=names_attr,
+    )
     if existing_names is None:
         existing_names = []
-        setattr(metric_source, _REGISTERED_METRIC_NAMES_ATTR, existing_names)
+        setattr(metric_source, names_attr, existing_names)
     existing_names.extend(registered_names)
 
 
@@ -233,6 +255,7 @@ def _discover_registered_metrics(
     model_parts: Sequence[nn.Module],
     *,
     pp_enabled: bool,
+    names_attr: str = _REGISTERED_METRIC_NAMES_ATTR,
 ) -> list[tuple[MetricSource, str, str]]:
     """Build the full model name for every registered tensor metric.
 
@@ -280,7 +303,11 @@ def _discover_registered_metrics(
             # A registration can belong to the module itself or one parameter.
             for metric_source, source_path in metric_sources:
                 for registered_name in (
-                    _get_registered_metric_names(metric_source) or ()
+                    _get_registered_metric_names(
+                        metric_source,
+                        names_attr=names_attr,
+                    )
+                    or ()
                 ):
                     full_metric_name = ".".join(
                         part for part in (source_path, registered_name) if part
