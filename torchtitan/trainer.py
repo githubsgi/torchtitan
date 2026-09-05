@@ -581,6 +581,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         self.tensor_logging = None
         self.vector_logging = None
+        self.publish_vector_distributions = False
+        # Rows accumulated per vector metric so each layer gets a step-by-step
+        # heatmap; owned here because the publisher itself is stateless.
+        self.vector_view_history: dict[str, list[list[float]]] = {}
         tensor_logging_config = config.metrics.tensor_logging
         if tensor_logging_config.enabled:
             effective_freq = math.lcm(
@@ -612,16 +616,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     publish_elements=tensor_logging_config.publish_vector_elements,
                     pp_enabled=parallel_dims.pp_enabled,
                 )
+                self.publish_vector_distributions = (
+                    tensor_logging_config.publish_vector_distributions
+                )
+            elif tensor_logging_config.publish_vector_distributions:
+                logger.warning(
+                    "metrics.tensor_logging.publish_vector_distributions has no "
+                    "effect without metrics.tensor_logging.vector_metrics"
+                )
 
-            if (
-                tensor_logging_config.moe_shape_manifest
-                and torch.distributed.get_rank() == 0
-            ):
-                # Static shapes are identical on every rank; one writer avoids
-                # a write race on a shared filesystem.
-                moe_shapes.write_moe_shape_manifest(
-                    moe_shapes.collect_moe_shapes(self.model_parts),
-                    tensor_logging_config.moe_shape_manifest,
+            if tensor_logging_config.moe_shape_manifest:
+                shape_records = moe_shapes.collect_moe_shapes(self.model_parts)
+                if torch.distributed.get_rank() == 0:
+                    # Static shapes are identical on every rank; one writer
+                    # avoids a write race on a shared filesystem.
+                    moe_shapes.write_moe_shape_manifest(
+                        shape_records,
+                        tensor_logging_config.moe_shape_manifest,
+                    )
+                # Also publish as text so the shapes are readable next to the
+                # per-expert load they explain, rather than only on disk.
+                self.metrics_processor.logger.log_text(
+                    "metrics_tensor_shapes/moe_grouped_gemms",
+                    moe_shapes.manifest_markdown(shape_records),
+                    0,
                 )
 
         self.lr_schedulers = config.lr_scheduler.build(
@@ -1036,11 +1054,31 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         assert accumulated_loss is not None
 
         tensor_metrics: dict[str, int | float] = {}
+        vector_views: dict[str, list[float]] = {}
         if self.tensor_logging is not None and tensor_logging.is_enabled():
             with sl.log_trace_span("tensor_logging_collect"):
-                tensor_metrics = self.tensor_logging.collect()
+                # Namespace the tags so these land in their own collapsible
+                # TensorBoard/WandB section instead of burying loss, grad_norm
+                # and throughput at the root alongside thousands of series.
+                tensor_metrics = {
+                    f"metrics_tensor_values/{name}": value
+                    for name, value in self.tensor_logging.collect().items()
+                }
                 if self.vector_logging is not None:
-                    tensor_metrics.update(self.vector_logging.collect())
+                    if self.publish_vector_distributions:
+                        # One reduction feeds both surfaces; collect() alone
+                        # would clear the buffers before the vectors are read.
+                        vector_metrics, vector_views = (
+                            self.vector_logging.collect_with_vectors()
+                        )
+                    else:
+                        vector_metrics = self.vector_logging.collect()
+                    tensor_metrics.update(
+                        {
+                            f"metrics_tensor_shapes/{name}": value
+                            for name, value in vector_metrics.items()
+                        }
+                    )
 
         with sl.log_trace_span("collect_dist_metrics"):
 
@@ -1098,6 +1136,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 float(grad_norm.item()),
                 extra_metrics=extra_metrics,
             )
+            if vector_views:
+                tensor_logging.publish_vector_views(
+                    self.metrics_processor.logger,
+                    vector_views,
+                    self.step,
+                    history=self.vector_view_history,
+                    namespace="metrics_tensor_shapes",
+                )
 
     @record
     def train(self):

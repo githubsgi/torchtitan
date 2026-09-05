@@ -166,3 +166,38 @@ def write_moe_shape_manifest(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def manifest_markdown(records: Sequence[MoEShapeRecord]) -> str:
+    """Render the manifest as a Markdown table for a text metric sink.
+
+    Identical layers are collapsed into one row with a count, because the
+    interesting content is the set of distinct grouped-GEMM shapes, not the
+    repetition of one shape down the stack.
+    """
+
+    if not records:
+        return "No MoE layers found."
+
+    header = (
+        "| layers | experts | top_k | dim | hidden_dim | grouped GEMMs (K x N) |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+    )
+    rows: dict[tuple[Any, ...], int] = {}
+    for record in records:
+        key = (
+            record.num_experts,
+            record.top_k,
+            record.dim,
+            record.hidden_dim,
+            tuple((gemm.name, gemm.k, gemm.n) for gemm in record.grouped_gemms),
+        )
+        rows[key] = rows.get(key, 0) + 1
+
+    lines = []
+    for (num_experts, top_k, dim, hidden_dim, gemms), count in rows.items():
+        shapes = ", ".join(f"{name}: {k} x {n}" for name, k, n in gemms)
+        lines.append(
+            f"| {count} | {num_experts} | {top_k} | {dim} | {hidden_dim} | {shapes} |"
+        )
+    return header + "\n".join(lines)

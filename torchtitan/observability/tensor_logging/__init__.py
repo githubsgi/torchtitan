@@ -18,6 +18,7 @@ from .runtime import (
 from .vector_metrics import (
     init_vectors,
     log_vector,
+    publish_vector_views,
     register_vector,
     VectorLoggingState,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "log_fwd_bwd_stats",
     "log_stats",
     "log_vector",
+    "publish_vector_views",
     "register",
     "register_fwd_bwd",
     "register_vector",

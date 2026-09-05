@@ -119,3 +119,18 @@ def test_manifest_round_trips_to_json(tmp_path) -> None:
     layer = payload["moe_layers"][0]
     assert layer["num_experts"] == 4
     assert layer["grouped_gemms"][0] == {"name": "w1", "k": 8, "n": 16}
+
+
+def test_manifest_markdown_collapses_identical_layers() -> None:
+    parts = [
+        _model(_moe(_StockExperts(num_experts=4, hidden_dim=16, dim=8))),
+        _model(_moe(_StockExperts(num_experts=4, hidden_dim=16, dim=8))),
+    ]
+
+    table = moe_shapes.manifest_markdown(moe_shapes.collect_moe_shapes(parts))
+
+    # Two structurally identical layers become one row carrying the count.
+    assert len(table.strip().splitlines()) == 3
+    assert "| 2 | 4 |" in table
+    assert "w1: 8 x 16" in table
+    assert "w2: 16 x 8" in table

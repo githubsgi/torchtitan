@@ -37,8 +37,8 @@ first gives `[10, 30]` and the correct ratio `30 / 20 = 1.5`.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
-from typing import cast
+from collections.abc import Iterable, Mapping, Sequence
+from typing import cast, Protocol
 
 import torch
 import torch.distributed as dist
@@ -65,6 +65,205 @@ _REGISTERED_VECTOR_NAMES_ATTR = "_tensor_logging_registered_vector_names"
 _VECTOR_BUFFER_SLOTS_ATTR = "_tensor_logging_vector_buffer_slots"
 
 _active_state: VectorLoggingState | None = None
+
+# Numeric path components identify siblings that belong on one heatmap:
+# `layers.0.moe.tokens_per_expert` and `layers.7.moe.tokens_per_expert` differ
+# only in the layer index, so they stack into rows of a single image.
+_PATH_INDEX_PATTERN = re.compile(r"\d+")
+
+# Nine evenly spaced viridis samples, linearly interpolated at publish time. A
+# grayscale heatmap makes small differences in expert load nearly invisible;
+# viridis is perceptually uniform, so equal steps in load read as equal steps
+# in colour. Kept as a literal so this stays PyTorch-only (no matplotlib).
+_VIRIDIS_ANCHORS = (
+    (0.267, 0.005, 0.329),
+    (0.283, 0.141, 0.458),
+    (0.254, 0.265, 0.530),
+    (0.207, 0.372, 0.553),
+    (0.164, 0.471, 0.558),
+    (0.129, 0.563, 0.551),
+    (0.181, 0.701, 0.488),
+    (0.478, 0.821, 0.318),
+    (0.993, 0.906, 0.144),
+)
+
+# A 26x64 image renders as a postage stamp in TensorBoard, so cells are zoomed
+# to roughly this many pixels on the longer axis before publishing.
+_HEATMAP_TARGET_PIXELS = 512
+_MAX_CELL_PIXELS = 16
+
+# Cells between gridlines, standing in for the axis ticks a TensorBoard image
+# cannot draw.
+_GRIDLINE_EVERY = 8
+
+# Rows retained per timeline image. Bounded so a long run cannot grow the
+# history without limit; once full, the oldest step is dropped.
+_MAX_TIMELINE_ROWS = 256
+
+
+class VectorViewSink(Protocol):
+    """The subset of the metrics logger that non-scalar views need."""
+
+    def log_histogram(self, name: str, values: Sequence[float], step: int) -> None: ...
+
+    def log_histogram_bins(
+        self, name: str, bin_edges: Sequence[float], counts: Sequence[float], step: int
+    ) -> None: ...
+
+    def log_image(self, name: str, image_chw: torch.Tensor, step: int) -> None: ...
+
+    def log_text(self, name: str, text: str, step: int) -> None: ...
+
+
+def _sibling_group_key(metric_name: str) -> str:
+    return _PATH_INDEX_PATTERN.sub("*", metric_name)
+
+
+def _sort_key(metric_name: str) -> list[int]:
+    return [int(part) for part in _PATH_INDEX_PATTERN.findall(metric_name)]
+
+
+def _normalize_row(values: Sequence[float]) -> list[float]:
+    """Scale one vector to [0, 1] by its own maximum.
+
+    Absolute token counts differ between layers and steps, but the question a
+    heatmap answers is where the mass sits *within* a row, so per-row scaling
+    keeps a balanced layer uniform instead of dark just because it saw fewer
+    tokens.
+    """
+
+    row_max = max(values)
+    if row_max <= 0.0:
+        return [0.0] * len(values)
+    return [value / row_max for value in values]
+
+
+def _to_image(rows: list[list[float]]) -> torch.Tensor:
+    """Turn normalized rows into a zoomed RGB `[3, H, W]` tensor.
+
+    TensorBoard image cards render no axes, so every eighth row and column
+    boundary gets a white rule. That is what makes a cell countable: the
+    legend text names row 0, and the rules let you find row 16 or expert 40
+    without measuring pixels.
+    """
+
+    intensity = torch.tensor(rows, dtype=torch.float32)
+    anchors = torch.tensor(_VIRIDIS_ANCHORS, dtype=torch.float32)
+    scaled = intensity.clamp(0.0, 1.0) * (anchors.shape[0] - 1)
+    lower = scaled.floor().long().clamp(max=anchors.shape[0] - 2)
+    frac = (scaled - lower.to(scaled.dtype)).unsqueeze(-1)
+    rgb = anchors[lower] * (1.0 - frac) + anchors[lower + 1] * frac
+
+    image_chw = rgb.permute(2, 0, 1).contiguous()
+    height, width = image_chw.shape[1], image_chw.shape[2]
+    zoom = max(1, min(_HEATMAP_TARGET_PIXELS // max(height, width), _MAX_CELL_PIXELS))
+    if zoom == 1:
+        # Without zoom a rule would overwrite the cell it is meant to delimit.
+        return image_chw
+
+    image_chw = image_chw.repeat_interleave(zoom, dim=1).repeat_interleave(zoom, dim=2)
+    for cell in range(_GRIDLINE_EVERY, height, _GRIDLINE_EVERY):
+        image_chw[:, cell * zoom, :] = 1.0
+    for cell in range(_GRIDLINE_EVERY, width, _GRIDLINE_EVERY):
+        image_chw[:, :, cell * zoom] = 1.0
+    return image_chw
+
+
+def _legend(header: str, row_labels: list[str], values: list[Sequence[float]]) -> str:
+    """Describe what each heatmap row is, since images carry no axis labels."""
+
+    lines = [
+        header,
+        "",
+        "| row | series | peak | imbalance (max/mean) |",
+        "| --- | --- | --- | --- |",
+    ]
+    for index, (label, row) in enumerate(zip(row_labels, values)):
+        mean = sum(row) / len(row)
+        peak = max(row)
+        imbalance = peak / mean if mean > 0.0 else 0.0
+        lines.append(f"| {index} | {label} | {peak:.4g} | {imbalance:.3f} |")
+    return "\n".join(lines)
+
+
+def _tag(namespace: str, name: str) -> str:
+    return f"{namespace}/{name}" if namespace else name
+
+
+def publish_vector_views(
+    sink: VectorViewSink,
+    vectors: Mapping[str, Sequence[float]],
+    step: int,
+    *,
+    history: dict[str, list[list[float]]] | None = None,
+    namespace: str = "",
+) -> None:
+    """Publish histogram, heatmap and per-layer timeline views of each vector.
+
+    Scalar series answer "is this drifting"; these answer "what does the
+    distribution look like right now". For a 27-layer, 64-expert model that is
+    26 histograms plus one 26x64 image, rather than the 1664 scalar series
+    `publish_vector_elements` would emit to carry the same information.
+
+    Passing `history` (a caller-owned dict that persists across steps) adds one
+    timeline image per metric, with rows for steps and columns for elements, so
+    a single layer's routing can be read over time instead of only across
+    layers at one step.
+
+    `namespace` prefixes every emitted tag. History stays keyed by the bare
+    metric name so changing the namespace cannot orphan an accumulated
+    timeline.
+    """
+
+    groups: dict[str, list[tuple[str, Sequence[float]]]] = {}
+    for metric_name, values in vectors.items():
+        if not values:
+            continue
+        sink.log_histogram(_tag(namespace, f"{metric_name}.hist"), values, step)
+        # One bin per element, so bar height is that element's value and the
+        # x axis is the element index. This shares the timeline image's x axis
+        # and, unlike `.hist`, keeps which element is hot rather than only how
+        # the loads are distributed.
+        sink.log_histogram_bins(
+            _tag(namespace, f"{metric_name}.hist_by_element"),
+            [float(index) for index in range(len(values) + 1)],
+            values,
+            step,
+        )
+        groups.setdefault(_sibling_group_key(metric_name), []).append(
+            (metric_name, values)
+        )
+        if history is not None and len(values) >= 2:
+            rows = history.setdefault(metric_name, [])
+            rows.append(_normalize_row(values))
+            del rows[:-_MAX_TIMELINE_ROWS]
+            sink.log_image(
+                _tag(namespace, f"{metric_name}.timeline"), _to_image(rows), step
+            )
+
+    for group_key, members in groups.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda member: _sort_key(member[0]))
+        width = len(members[0][1])
+        if width < 2 or any(len(values) != width for _, values in members):
+            continue
+        name = f"{group_key.replace('*', 'all')}.heatmap"
+        sink.log_image(
+            _tag(namespace, name),
+            _to_image([_normalize_row(values) for _, values in members]),
+            step,
+        )
+        sink.log_text(
+            _tag(namespace, f"{name}.legend"),
+            _legend(
+                "Rows top-to-bottom, columns are vector elements left-to-right. "
+                "Each row is scaled by its own maximum.",
+                [metric_name for metric_name, _ in members],
+                [values for _, values in members],
+            ),
+            step,
+        )
 
 
 class VectorBuffers(nn.Module):
@@ -327,6 +526,29 @@ class VectorLoggingState:
         self.vector_buffers.clear()
         return metrics
 
+    def collect_with_vectors(
+        self,
+    ) -> tuple[dict[str, int | float], dict[str, list[float]]]:
+        """Reduce once and return both derived scalars and the global vectors.
+
+        Calling `collect()` and `collect_vectors()` in sequence would issue two
+        collectives, and the second would read buffers the first already
+        cleared. Callers that want both surfaces on the same step use this.
+        """
+
+        reduced = self._reduce_buffers()
+        metrics = self._buffers_to_metrics(reduced)
+        vectors = self._rows_to_vectors(reduced)
+        self.vector_buffers.clear()
+        return metrics, vectors
+
+    def _rows_to_vectors(self, reduced: torch.Tensor) -> dict[str, list[float]]:
+        rows = cast(list[list[float]], reduced.detach().cpu().tolist())
+        return {
+            metric_name: rows[row][: self.widths[row]]
+            for row, metric_name in enumerate(self.full_metric_names)
+        }
+
     def collect_vectors(self) -> dict[str, list[float]]:
         """Return the reduced global vectors themselves, without resetting.
 
@@ -335,11 +557,7 @@ class VectorLoggingState:
         it here instead of reconstructing it from published scalars.
         """
 
-        rows = cast(list[list[float]], self._reduce_buffers().detach().cpu().tolist())
-        return {
-            metric_name: rows[row][: self.widths[row]]
-            for row, metric_name in enumerate(self.full_metric_names)
-        }
+        return self._rows_to_vectors(self._reduce_buffers())
 
     def close(self) -> None:
         global _active_state

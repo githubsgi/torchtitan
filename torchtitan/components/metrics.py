@@ -7,6 +7,7 @@
 import os
 import time
 from collections import namedtuple
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
@@ -109,6 +110,25 @@ class BaseLogger:
     def log(self, metrics: dict[str, Any], step: int) -> None:
         pass
 
+    def log_histogram(self, name: str, values: Sequence[float], step: int) -> None:
+        pass
+
+    def log_histogram_bins(
+        self, name: str, bin_edges: Sequence[float], counts: Sequence[float], step: int
+    ) -> None:
+        """Publish an already-binned histogram.
+
+        `bin_edges` has one more entry than `counts`. Unlike `log_histogram`,
+        the caller controls what a bin means, so a bin can be an expert index
+        rather than a range of values.
+        """
+
+    def log_image(self, name: str, image_chw: torch.Tensor, step: int) -> None:
+        """Publish an RGB image given as a float `[3, H, W]` tensor in [0, 1]."""
+
+    def log_text(self, name: str, text: str, step: int) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -121,6 +141,9 @@ class TensorBoardLogger(BaseLogger):
         self.writer = SummaryWriter(log_dir, max_queue=1000)
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
+    def _tag(self, name: str) -> str:
+        return name if self.tag is None else f"{self.tag}/{name}"
+
     def log(self, metrics: dict[str, Any], step: int) -> None:
         summary = Summary()
         for key, value in metrics.items():
@@ -132,6 +155,42 @@ class TensorBoardLogger(BaseLogger):
         # Submit one event instead of one queue operation per scalar.
         file_writer = cast(Any, self.writer._get_file_writer())
         file_writer.add_summary(summary, step)
+
+    def log_histogram(self, name: str, values: Sequence[float], step: int) -> None:
+        self.writer.add_histogram(
+            self._tag(name),
+            torch.tensor(values, dtype=torch.float32),
+            step,
+        )
+
+    def log_histogram_bins(
+        self, name: str, bin_edges: Sequence[float], counts: Sequence[float], step: int
+    ) -> None:
+        # add_histogram would re-bin a sample population by magnitude. The raw
+        # form takes the buckets as given, which is what lets a bucket stand for
+        # an expert index. The moments describe the bin-index distribution
+        # weighted by count, so TensorBoard's summary stats stay meaningful.
+        total = float(sum(counts))
+        centers = [
+            (bin_edges[i] + bin_edges[i + 1]) / 2.0 for i in range(len(counts))
+        ]
+        self.writer.add_histogram_raw(
+            tag=self._tag(name),
+            min=bin_edges[0],
+            max=bin_edges[-1],
+            num=total,
+            sum=sum(c * w for c, w in zip(centers, counts)),
+            sum_squares=sum(c * c * w for c, w in zip(centers, counts)),
+            bucket_limits=list(bin_edges[1:]),
+            bucket_counts=list(counts),
+            global_step=step,
+        )
+
+    def log_image(self, name: str, image_chw: torch.Tensor, step: int) -> None:
+        self.writer.add_image(self._tag(name), image_chw, step, dataformats="CHW")
+
+    def log_text(self, name: str, text: str, step: int) -> None:
+        self.writer.add_text(self._tag(name), text, step)
 
     def close(self) -> None:
         self.writer.close()
@@ -178,6 +237,35 @@ class WandBLogger(BaseLogger):
         }
         self.wandb.log(wandb_metrics, step=step)
 
+    def _tag(self, name: str) -> str:
+        return name if self.tag is None else f"{self.tag}/{name}"
+
+    def log_histogram(self, name: str, values: Sequence[float], step: int) -> None:
+        self.wandb.log(
+            {self._tag(name): self.wandb.Histogram(list(values))}, step=step
+        )
+
+    def log_histogram_bins(
+        self, name: str, bin_edges: Sequence[float], counts: Sequence[float], step: int
+    ) -> None:
+        self.wandb.log(
+            {
+                self._tag(name): self.wandb.Histogram(
+                    np_histogram=(list(counts), list(bin_edges))
+                )
+            },
+            step=step,
+        )
+
+    def log_image(self, name: str, image_chw: torch.Tensor, step: int) -> None:
+        self.wandb.log(
+            {self._tag(name): self.wandb.Image(image_chw.permute(1, 2, 0).numpy())},
+            step=step,
+        )
+
+    def log_text(self, name: str, text: str, step: int) -> None:
+        self.wandb.log({self._tag(name): text}, step=step)
+
     def close(self) -> None:
         if self.wandb.run is not None:
             self.wandb.finish()
@@ -195,6 +283,24 @@ class LoggerContainer(BaseLogger):
     def log(self, metrics: dict[str, Any], step: int) -> None:
         for logger_instance in self._loggers:
             logger_instance.log(metrics, step)
+
+    def log_histogram(self, name: str, values: Sequence[float], step: int) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.log_histogram(name, values, step)
+
+    def log_histogram_bins(
+        self, name: str, bin_edges: Sequence[float], counts: Sequence[float], step: int
+    ) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.log_histogram_bins(name, bin_edges, counts, step)
+
+    def log_image(self, name: str, image_chw: torch.Tensor, step: int) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.log_image(name, image_chw, step)
+
+    def log_text(self, name: str, text: str, step: int) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.log_text(name, text, step)
 
     @property
     def number_of_loggers(self) -> int:
@@ -310,6 +416,15 @@ class TensorLoggingConfig(Configurable.Config):
     Off by default: a 64-expert model with 32 MoE layers would emit 2048 extra
     series per logging step. Derived `total`, `max`, `min`, `mean` and
     `imbalance` values are published either way.
+    """
+
+    publish_vector_distributions: bool = False
+    """Whether to publish histogram and heatmap views of each vector metric.
+
+    Scalar series show drift over time; these show the shape of the
+    distribution at a step. One histogram per vector plus one image stacking
+    sibling layers carries what `publish_vector_elements` would need thousands
+    of scalar series to convey.
     """
 
     moe_shape_manifest: str = ""
