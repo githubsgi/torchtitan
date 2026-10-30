@@ -243,10 +243,20 @@ class MuseSparkRMSNormWithInputScale(MuseSparkRMSNorm):
     class Config(MuseSparkRMSNorm.Config):
         pass
 
-    @local_compile("muse_spark_input_scaled_rmsnorm", batch_invariant=False)
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Add gain_center outside the compiled region. Layers can use different gain_center
+        # floats, and Dynamo recompiles the region with a symbolic float whose graph saves
+        # an extra 0-dim tensor. AC recompute then hits that newer graph and fails the
+        # saved-tensor metadata check.
+        return self._input_scaled_rms_norm(input, self._get_effective_weight())
+
+    @local_compile("muse_spark_input_scaled_rmsnorm", batch_invariant=False)
+    def _input_scaled_rms_norm(
+        self,
+        input: torch.Tensor,
+        effective_weight_D: torch.Tensor | None,
+    ) -> torch.Tensor:
         input_dtype = input.dtype
-        effective_weight_D = self._get_effective_weight()
         if effective_weight_D is not None:
             input = effective_weight_D * input
         output_TD = F.rms_norm(input, self.normalized_shape, None, self.eps)
